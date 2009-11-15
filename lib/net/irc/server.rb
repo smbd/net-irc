@@ -92,7 +92,7 @@ class Net::IRC::Server
 			while l = @socket.gets
 				begin
 					@log.debug "RECEIVE: #{l.chomp}"
-					m = Message.parse(l)
+                                        m = Message.parse(l.chomp+"\r\n")
 					next if on_message(m) === true
 
 					name = "on_#{(COMMANDS[m.command.upcase] || m.command).downcase}"
