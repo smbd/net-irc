@@ -222,7 +222,7 @@ report user as spammer
 Ruby's by cho45
 
 =end
-
+Dir.chdir File.dirname(__FILE__)
 case
 when File.directory?("lib")
 	$LOAD_PATH << "lib"
