@@ -1262,7 +1262,7 @@ class TwitterIrcGateway < Net::IRC::Server::Session
 			screen_name = "@#{status.user.screen_name}"
 			rt_message = generate_status_message(status.text)
 			text = "#{comment}RT #{screen_name}: #{rt_message}"
-			ret = api("statuses/update", { :status => text, :source => source })
+			ret = api("statuses/update", { :status => text, :source => source, :in_reply_to_status_id => status.id })
 			log oops(ret) if ret.truncated
 			log "Status updated (RT to #{@opts.tid % tid}: #{text})"
 			ret.user.status = ret
