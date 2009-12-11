@@ -317,11 +317,9 @@ class TwitterIrcGateway < Net::IRC::Server::Session
 
 	def initialize(*args)
 		super
-		@groups        = {}
-		@channels      = [] # joined channels (groups)
+		@channels      = {}
 		@nicknames     = {}
 		@drones        = []
-		@config        = Pathname.new(ENV["HOME"]) + ".tig" ### TODO マルチユーザに対応してない
 		@etags         = {}
 		@consums       = []
 		@limit         = hourly_limit
@@ -332,7 +330,7 @@ class TwitterIrcGateway < Net::IRC::Server::Session
 		@im_thread     =
 		@utf7          =
 		@httpproxy     = nil
-		load_config
+		@ratelimit     = RateLimit.new(150)
 	end
 
 	def on_user(m)
@@ -418,11 +416,7 @@ class TwitterIrcGateway < Net::IRC::Server::Session
 			end
 		end if @opts.tid
 
-		@ratio = (@opts.ratio || "121").split(":")
-		@ratio = Struct.new(:timeline, :dm, :mentions).new(*@ratio)
-		@ratio.dm       ||= @opts.dm == true ? @opts.mentions ?  6 : 26 : @opts.dm
-		@ratio.mentions ||= @opts.mentions == true ? @opts.dm ? 20 : 26 : @opts.mentions
-
+		@ratelimit.register(:check_friends, 3600)
 		@check_friends_thread = Thread.start do
 			loop do
 				begin
@@ -435,7 +429,7 @@ class TwitterIrcGateway < Net::IRC::Server::Session
 						@log.error "\t#{l}"
 					end
 				end
-				sleep @opts.check_friends_interval || 3600
+				sleep @rate.interval(:check_friends)
 			end
 		end
 
@@ -471,12 +465,18 @@ class TwitterIrcGateway < Net::IRC::Server::Session
 			sleep @opts.check_updates_interval || 86400
 		end
 
+		@ratelimit.register(:timeline, 30)
 		@check_timeline_thread = Thread.start do
 			sleep 2 * (@me.friends_count / 100.0).ceil
+			sleep 10
 
 			loop do
 				begin
-					check_timeline
+					if check_timeline
+						@ratelimit.incr(:timeline)
+					else
+						@ratelimit.decr(:timeline)
+					end
 				rescue APIFailed => e
 					@log.error e.inspect
 				rescue Exception => e
@@ -485,14 +485,19 @@ class TwitterIrcGateway < Net::IRC::Server::Session
 						@log.error "\t#{l}"
 					end
 				end
-				sleep interval(@ratio.timeline)
+				sleep @ratelimit.interval(:timeline)
 			end
 		end
 
+		@ratelimit.register(:dm, 600)
 		@check_dms_thread = Thread.start do
 			loop do
 				begin
-					check_direct_messages
+					if check_direct_messages
+						@ratelimit.incr(:dm)
+					else
+						@ratelimit.decr(:dm)
+					end
 				rescue APIFailed => e
 					@log.error e.inspect
 				rescue Exception => e
@@ -501,16 +506,21 @@ class TwitterIrcGateway < Net::IRC::Server::Session
 						@log.error "\t#{l}"
 					end
 				end
-				sleep interval(@ratio.dm)
+				sleep @ratelimit.interval(:dm)
 			end
 		end if @opts.dm
 
+		@ratelimit.register(:mentions, 180)
 		@check_mentions_thread = Thread.start do
-			sleep interval(@ratio.timeline) / 2
+			sleep @ratelimit.interval(:timeline)
 
 			loop do
 				begin
-					check_mentions
+					if check_mentions
+						@ratelimit.incr(:mentions)
+					else
+						@ratelimit.decr(:mentions)
+					end
 				rescue APIFailed => e
 					@log.error e.inspect
 				rescue Exception => e
@@ -519,19 +529,70 @@ class TwitterIrcGateway < Net::IRC::Server::Session
 						@log.error "\t#{l}"
 					end
 				end
-				sleep interval(@ratio.mentions)
+				sleep @ratelimit.interval(:mentions)
 			end
 		end if @opts.mentions
+
+		@ratelimit.register(:lists, 60 * 60)
+		@check_lists_thread = Thread.start do
+			sleep 60
+			Thread.current[:last_updated] = Time.at(0)
+			loop do
+				begin
+					@log.info "LISTS update now..."
+					if check_lists
+						@ratelimit.incr(:lists)
+					else
+						@ratelimit.decr(:lists)
+					end
+					Thread.current[:last_updated] = Time.now
+
+					sleep @ratelimit.interval(:lists)
+				rescue Exception => e
+					@log.error e.inspect
+					e.backtrace.each do |l|
+						@log.error "\t#{l}"
+					end
+					sleep 60
+				end
+			end
+		end
+
+		@ratelimit.register(:lists_status, 60 * 5)
+		@check_lists_status_thread = Thread.start do
+			Thread.current[:last_updated] = Time.at(0)
+			loop do
+				begin
+					@log.info "lists/status update now... #{@channels.size}"
+					## TODO 各リストにつき limit が必要
+					if check_lists_status
+						@ratelimit.incr(:lists_status)
+					else
+						@ratelimit.decr(:lists_status)
+					end
+					Thread.current[:last_updated] = Time.now
+				rescue Exception => e
+					@log.error e.inspect
+					e.backtrace.each do |l|
+						@log.error "\t#{l}"
+					end
+				end
+				sleep @ratelimit.register(:lists_status)
+			end
+		end
+
 	end
 
 	def on_disconnected
-		@check_friends_thread.kill  rescue nil
-		@check_timeline_thread.kill rescue nil
-		@check_mentions_thread.kill rescue nil
-		@check_dms_thread.kill      rescue nil
-		@check_updates_thread.kill  rescue nil
-		@im_thread.kill             rescue nil
-		@im.disconnect              rescue nil
+		@check_friends_thread.kill      rescue nil
+		@check_timeline_thread.kill     rescue nil
+		@check_mentions_thread.kill     rescue nil
+		@check_dms_thread.kill          rescue nil
+		@check_updates_thread.kill      rescue nil
+		@check_lists_thread.kill        rescue nil
+		@check_lists_status_thread.kill rescue nil
+		@im_thread.kill                 rescue nil
+		@im.disconnect                  rescue nil
 	end
 
 	def on_privmsg(m)
@@ -688,9 +749,9 @@ class TwitterIrcGateway < Net::IRC::Server::Session
 			users.concat @friends.reverse if @friends
 			users.each {|friend| whoreply.call channel, friend }
 			post server_name, RPL_ENDOFWHO, @nick, channel
-		when (@groups.key?(channel) and @friends)
-			@groups[channel].each do |nick|
-				whoreply.call channel, friend(nick)
+		when (@channels.key?(channel) and @friends)
+			@channels[channel][:members].each do |user|
+				whoreply.call channel, user
 			end
 			post server_name, RPL_ENDOFWHO, @nick, channel
 		else
@@ -704,12 +765,16 @@ class TwitterIrcGateway < Net::IRC::Server::Session
 			channel = channel.split(" ", 2).first
 			next if channel.casecmp(main_channel).zero?
 
-			@channels << channel
-			@channels.uniq!
-			post @prefix, JOIN, channel
-			post server_name, MODE, channel, "+mtio", @nick
-			post server_name, MODE, channel, "+q", @nick
-			save_config
+# auto rejoin のとき勝手に作って困るのでコメントアウト。
+# create するまえに、必ず check_lists するようにしないと。
+#			name = channel[1..-1]
+#			unless @channels.find{|c| c.slug == name }
+#				@log.info "create list: #{name}"
+#				api("1/#{@me.screen_name}/lists",{'name' => name })
+#			end
+#			post @prefix, JOIN, channel
+#			post server_name, MODE, channel, "+mtio", @nick
+#			post server_name, MODE, channel, "+q", @nick
 		end
 	end
 
@@ -717,8 +782,12 @@ class TwitterIrcGateway < Net::IRC::Server::Session
 		channel = m.params[0]
 		return if channel.casecmp(main_channel).zero?
 
-		@channels.delete(channel)
-		post @prefix, PART, channel, "Ignore group #{channel}, but setting is alive yet."
+# いきなり delete とか危険なのでコメントアウト
+# IRC Gateway 側に流れない、という挙動にし、delete するには ctcp を必要に
+#		name = channel[1..-1]
+#		@log.info "delete list: #{name}"
+#		api("1/#{@me.screen_name}/lists/#{name}",{'_method' => 'DELETE' }) rescue nil
+#		post @prefix, PART, channel, "Ignore group #{channel}, but setting is alive yet."
 	end
 
 	def on_invite(m)
@@ -743,9 +812,10 @@ class TwitterIrcGateway < Net::IRC::Server::Session
 				@me.friends_count += 1
 			end
 		when friend
-			((@groups[channel] ||= []) << friend.screen_name).uniq!
-			join channel, [friend]
-			save_config
+			slug = channel[1..-1]
+			api("/1/#{@me.screen_name}/#{slug}/members",{'id'=>friend.id})
+			@channels[channel][:members] << friend
+			join(channel, [friend])
 		else
 			post server_name, ERR_NOSUCHNICK, nick, "No such nick/channel"
 		end
@@ -767,9 +837,10 @@ class TwitterIrcGateway < Net::IRC::Server::Session
 		else
 			friend = friend(nick)
 			if friend
-				(@groups[channel] ||= []).delete(friend.screen_name)
+				slug = channel[1..-1]
+				api("/1/#{@me.screen_name}/#{slug}/members",{'id'=>friend.id, '_method'=>'DELETE'})
+				@channels[channel][:members].delete_if{|u| u.screen_name == friend.screen_name }
 				post prefix(friend), PART, channel, "Removed: #{msg}"
-				save_config
 			else
 				post server_name, ERR_NOSUCHNICK, nick, "No such nick/channel"
 			end
@@ -882,7 +953,6 @@ class TwitterIrcGateway < Net::IRC::Server::Session
 			@nicknames[screen_name] = nickname
 			log "Call #{screen_name} as #{nickname}"
 		end
-		#save_config
 	end
 
 	ctcp_action "debug" do |target, mesg, command, args|
@@ -1003,35 +1073,7 @@ class TwitterIrcGateway < Net::IRC::Server::Session
 	end
 
 	ctcp_action "ratio", "ratios" do |target, mesg, command, args|
-		unless args.empty?
-			args = args.first.split(":") if args.size == 1
-			case
-			when @opts.dm && @opts.mentions && args.size < 3
-				log "/me ratios <timeline> <dm> <mentions>"
-				return
-			when @opts.dm && args.size < 2
-				log "/me ratios <timeline> <dm>"
-				return
-			when @opts.mentions && args.size < 2
-				log "/me ratios <timeline> <mentions>"
-				return
-			end
-			ratios = args.map {|ratio| ratio.to_f }
-			if ratios.any? {|ratio| ratio <= 0.0 }
-				log "Ratios must be greater than 0.0 and fractional values are permitted."
-				return
-			end
-			@ratio.timeline = ratios[0]
-
-			case
-			when @opts.dm
-				@ratio.dm       = ratios[1]
-				@ratio.mentions = ratios[2] if @opts.mentions
-			when @opts.mentions
-				@ratio.mentions = ratios[1]
-			end
-		end
-		log "Intervals: " + @ratio.zip([:timeline, :dm, :mentions]).map {|ratio, name| [name,  "#{interval(ratio).round}sec"] }.inspect
+		log "Intervals: #{@ratelimit.inspect}"
 	end
 
 	ctcp_action "rm", %r/\A(?:de(?:stroy|l(?:ete)?)|miss|oops|r(?:emove|m))\z/ do |target, mesg, command, args|
@@ -1182,8 +1224,6 @@ class TwitterIrcGateway < Net::IRC::Server::Session
 				log "Marks #{bot} as a bot."
 			end
 		end
-		save_config
-
 	end
 
 	ctcp_action "home", "h" do |target, mesg, command, args|
@@ -1257,9 +1297,96 @@ class TwitterIrcGateway < Net::IRC::Server::Session
 		end
 	end
 
+	def check_lists
+		updated = false
+		until @friends
+			@log.debug "waiting retrieving friends..."
+			sleep 1
+		end
+
+		# FIXME: I dont support multipage
+		lists = page("1/#{@me.screen_name}/lists", :lists, true)
+
+		# expend lists.size API count
+		channels = {}
+		lists.each do |list|
+			begin
+				name = (list.user.screen_name == @me.screen_name) ?
+					   "##{list.slug}" : 
+					   "##{list.user.screen_name}^#{list.slug}"
+				members = page("1/#{@me.screen_name}/#{list.slug}/members", :users, true)
+				log "Miss match member_count '%s', lists:%d vs members:%s" % [ list.slug, list.member_count, members.size ] unless list.member_count == members.size
+
+				channel = {
+					:name      => name,
+					:list      => list,
+					:members   => members,
+					:inclusion => (members - @friends).empty?
+				}
+
+				new = channel[:members]
+				old = @channels.fetch(channel[:name], { :members => [] })[:members]
+
+				# deleted user
+				(old - new).each do|user|
+					post prefix(user), PART, name, "Removed: #{user.screen_name}"
+					updated = true
+				end
+
+				# new user
+				(new - old).each do|user|
+					join name, [user]
+					updated = true
+				end
+
+				channels[name] = channel
+			rescue APIFailed => e
+				log e.inspect
+			end
+		end
+
+		# unfollowed
+		(@channels.keys - channels.keys).each do |name|
+			post @prefix, PART, name, "No longer follow the list #{name}"
+			updated = true
+		end
+
+		# followed
+		(channels.keys - @channels.keys).each do |name|
+			post @prefix, JOIN, name
+			post server_name, MODE, name, "+mtio", @nick
+			post server_name, MODE, name, "+q", @nick
+			updated = true
+		end
+
+		@channels = channels
+		updated
+	end
+
+	def check_lists_status
+		friends = @friends || []
+		@channels.each do |name, channel|
+			# タイムラインに全員含まれているならとってこなくてもよいが
+			# そうでなければ個別にとってくる必要がある。
+			next if channel[:inclusion]
+
+			list = channel[:list]
+			@log.debug "retrieve #{name} statuses"
+			res = api("1/#{list.user.screen_name}/lists/#{list.id}/statuses", {
+				:since_id => channel[:last_id]
+			})
+			res.reverse_each do |s|
+				next if channel[:members].include? s.user
+				# TODO tid
+				message(s, name, nil, nil, channel[:last_id] ? PRIVMSG : NOTICE)
+			end
+			channel[:last_id] = res.first.id
+		end
+	end
+
 	def check_friends
 		if @friends.nil?
-			@friends = page("statuses/friends/#{@me.id}", @me.friends_count)
+			@friends = page("statuses/friends/#{@me.id}", :users)
 			if @opts.athack
 				join main_channel, @friends
 			else
@@ -1278,37 +1405,40 @@ class TwitterIrcGateway < Net::IRC::Server::Session
 				post server_name, RPL_ENDOFNAMES, @nick, main_channel, "End of NAMES list"
 			end
 		else
-			new_ids    = page("friends/ids/#{@me.id}", @me.friends_count)
-			friend_ids = @friends.reverse.map {|friend| friend.id }
+			@me = api("account/update_profile") #api("account/verify_credentials")
+			if @me.friends_count != @friends.size
+				new_ids    = page("friends/ids/#{@me.id}", :ids)
+				friend_ids = @friends.reverse.map {|friend| friend.id }
 
-			(friend_ids - new_ids).each do |id|
-				@friends.delete_if do |friend|
-					if friend.id == id
-						post prefix(friend), PART, main_channel, ""
-						@me.friends_count -= 1
+				(friend_ids - new_ids).each do |id|
+					@friends.delete_if do |friend|
+						if friend.id == id
+							post prefix(friend), PART, main_channel, ""
+						end
 					end
 				end
-			end
 
-			new_ids -= friend_ids
-			unless new_ids.empty?
-				new_friends = page("statuses/friends/#{@me.id}", new_ids.size)
-				join main_channel, new_friends.delete_if {|friend|
-					@friends.any? {|i| i.id == friend.id }
-				}.reverse
-				@friends.concat new_friends
-				@me.friends_count += new_friends.size
+				new_ids -= friend_ids
+				unless new_ids.empty?
+					new_friends = page("statuses/friends/#{@me.id}", :users)
+					join main_channel, new_friends.delete_if {|friend|
+						@friends.any? {|i| i.id == friend.id }
+					}.reverse
+					@friends.concat new_friends
+				end
 			end
 		end
 	end
 
 	def check_timeline
+		updated = false
+
 		cmd  = PRIVMSG
 		path = "statuses/#{@opts.with_retweets ? "home" : "friends"}_timeline"
 		q    = { :count => 200 }
 		@latest_id ||= nil
 
-		case 
+		case
 		when @latest_id
 			q.update(:since_id => @latest_id)
 		when is_first_retrieve = !@me.statuses_count.zero? && !@me.friends_count.zero?
@@ -1354,14 +1484,19 @@ class TwitterIrcGateway < Net::IRC::Server::Session
 
 				message(status, main_channel, tid, nil, cmd)
 			end
-			@groups.each do |channel, members|
-				next unless members.include?(user.screen_name)
-				message(status, channel, tid, nil, cmd)
+			@channels.each do |name, channel|
+				if channel[:members].find{|m| m.screen_name == user.screen_name }
+					message(status, name, tid, nil, cmd)
+				end
 			end
+			updated = true
 		end
+
+		updated
 	end
 
 	def check_direct_messages
+		updated = false
 		@prev_dm_id ||= nil
 		q = @prev_dm_id ? { :count => 200, :since_id => @prev_dm_id } \
 		                : { :count => 1 }
@@ -1377,10 +1512,14 @@ class TwitterIrcGateway < Net::IRC::Server::Session
 			text = mesg.text
 			@log.debug [id, user.screen_name, text].inspect
 			message(user, @nick, tid, text)
+			updated = true
 		end
+		updated
 	end
 
 	def check_mentions
+		updated = false
+
 		return if @timeline.empty?
 		@prev_mention_id ||= @timeline.last.id
 		api("statuses/mentions", {
@@ -1404,7 +1543,9 @@ class TwitterIrcGateway < Net::IRC::Server::Session
 					break
 				end
 			end if @friends
+			updated = true
 		end
+		updated
 	end
 
 	def check_updates
@@ -1415,27 +1556,11 @@ class TwitterIrcGateway < Net::IRC::Server::Session
 		res = http(uri).request(http_req(:get, uri))
 
 		latest = JSON.parse(res.body)['commits'][0]['id']
-		unless server_version == latest
+		unless system('git', 'rev-parse', latest)
 			log "\002New version is available.\017 run 'git pull'."
 		end
 	rescue Errno::ECONNREFUSED, Timeout::Error => e
 		@log.error "Failed to get the latest revision of tig.rb from #{uri.host}: #{e.inspect}"
-	end
-
-	def interval(ratio)
-		now   = Time.now
-		max   = @opts.maxlimit || 0
-		limit = 0.98 * @limit # 98% of the rate limit
-		i     = 3600.0        # an hour in seconds
-		i *= @ratio.inject {|sum, r| sum.to_f + r.to_f } +
-		     @consums.delete_if {|t| t < now }.size
-		i /= ratio.to_f
-		i /= (0 < max && max < limit) ? max : limit
-		i = 60 * 30 if i > 60 * 30 # 30分以上止まらないように。
-		i
-	rescue => e
-		@log.error e.inspect
-		100
 	end
 
 	def join(channel, users)
@@ -1490,29 +1615,9 @@ class TwitterIrcGateway < Net::IRC::Server::Session
 		end
 	end
 
-	def save_config
-		config = {
-			:groups    => @groups,
-			:channels  => @channels,
-			#:nicknames => @nicknames,
-			:drones    => @drones,
-		}
-		@config.open("w") {|f| YAML.dump(config, f) }
-	end
-
-	def load_config
-		@config.open do |f|
-			config     = YAML.load(f)
-			@groups    = config[:groups]    || {}
-			@channels  = config[:channels]  || []
-			#@nicknames = config[:nicknames] || {}
-			@drones    = config[:drones]    || []
-		end
-	rescue Errno::ENOENT
-	end
-
-	def require_post?(path)
-		%r{
+	def require_post?(path,query)
+		case path
+		when %r{
 			\A
 			(?: status(?:es)?/update \z
 			  | direct_messages/new \z
@@ -1521,7 +1626,14 @@ class TwitterIrcGateway < Net::IRC::Server::Session
 			  | favou?ri(?: ing | tes )/create/
 			  | notifications/
 			  | blocks/create/ )
-		}x === path
+		}x
+			true
+		when %r{
+       \A
+       (?: 1/#{@me.screen_name} )
+    }x
+			query.key? 'name' or query.key? '_method' or query.key? 'id'
+		end
 	end
 
 	#def require_put?(path)
@@ -1530,21 +1642,20 @@ class TwitterIrcGateway < Net::IRC::Server::Session
 
 	def api(path, query = {}, opts = {})
 		path.sub!(%r{\A/+}, "")
-		query = query.to_query_str
 
 		authenticate = opts.fetch(:authenticate, true)
 
 		uri = api_base(authenticate)
 		uri.path += path
 		uri.path += ".json" if path != "users/username_available"
-		uri.query = query unless query.empty?
+		uri.query = query.to_query_str unless query.empty?
 
 		header      = {}
 		credentials = authenticate ? [@real, @pass] : nil
 		req         = case
 			when path.include?("/destroy/")
 				http_req :delete, uri, header, credentials
-			when require_post?(path)
+			when require_post?(path,query)
 				http_req :post,   uri, header, credentials
 			#when require_put?(path)
 			#	http_req :put,    uri, header, credentials
@@ -1619,17 +1730,18 @@ class TwitterIrcGateway < Net::IRC::Server::Session
 		raise APIFailed, e.inspect
 	end
 
-	def page(path, max_count, authenticate = false)
+	def page(path, name, authenticate = false, &block)
 		@limit_remaining_for_ip ||= 52
 		limit = 0.98 * @limit_remaining_for_ip # 98% of IP based rate limit
 		r     = []
-		cpp   = nil # counts per page
+		cursor = -1
 		1.upto(limit) do |num|
-			ret = api(path, { :page => num }, { :authenticate => authenticate })
-			cpp ||= ret.size
-			r.concat ret
-			break if ret.empty? or num >= max_count / cpp.to_f or
-			         ret.size != cpp or r.size >= max_count
+			# next_cursor にアクセスするとNot found が返ってくることがあるので，その時はbreak
+			ret = api(path, { :cursor => cursor }, { :authenticate => authenticate }) rescue break
+			arr = ret[name.to_s]
+			r.concat arr
+			cursor = ret[:next_cursor]
+			break if cursor.zero?
 		end
 		r
 	end
@@ -2051,6 +2163,21 @@ class TwitterIrcGateway < Net::IRC::Server::Session
 	                    :recipient_id, :recipient_screen_name, :recipient)
 	Geo    = Struct.new(:type, :coordinates, :geometries, :geometry, :properties, :id,
 	                    :crs, :name, :href, :bbox, :features)
+	List   = Struct.new(:mode, :uri, :slug, :member_count, :full_name, :name, :id, :subscriber_count, :user)
+
+	class User
+		def hash
+			self.id
+		end
+
+		def eql?(other)
+			self.id == other.id
+		end
+
+		def ==(other)
+			self.id == other.id
+		end
+	end
 
 	class TypableMap < Hash
 		#Roman = %w[
@@ -2135,6 +2262,45 @@ class TwitterIrcGateway < Net::IRC::Server::Session
 		undef update, merge, merge!, replace
 	end
 
+	class RateLimit
+		def initialize(limit)
+			@limit = limit
+			@rates = {}
+		end
+
+		def register(name, init_second=60)
+			@rates[name.to_sym] = {
+				:init => init_second.to_f,
+				:rate => init_second.to_f,
+			}
+		end
+
+		def unregister(name)
+			@rates.delete(name)
+		end
+
+		def inspect
+			"#<%s:0x%08x %s>" % [self.class, self.__id__,
+				@rates.keys.map {|name| "#{name}:#{interval(name)}" }.join(' ')
+			]
+		end
+
+		def interval(name)
+			rate  = (3600.0 / @rates[name][:rate]) / @rates.values.inject(0) {|r,i| r + 3600.0 / i[:rate] }
+			count = @limit * rate
+			(3600 / count).to_i
+		end
+
+		def incr(name)
+			@rates[name][:rate] /= 2
+			@rates[name][:rate]  = 10   if @rates[name][:rate] < 10
+		end
+
+		def decr(name)
+			@rates[name][:rate] *= 2
+			@rates[name][:rate]  = 3600 if @rates[name][:rate] > 3600
+		end
+	end
 
 end
 
@@ -2163,12 +2329,15 @@ class Hash
 				TwitterIrcGateway::DM.new
 			when struct_of?(TwitterIrcGateway::Geo)
 				TwitterIrcGateway::Geo.new
+			when struct_of?(TwitterIrcGateway::List)
+				TwitterIrcGateway::List.new
 			else
 				members = keys
 				members.concat TwitterIrcGateway::User.members
 				members.concat TwitterIrcGateway::Status.members
 				members.concat TwitterIrcGateway::DM.members
 				members.concat TwitterIrcGateway::Geo.members
+				members.concat TwitterIrcGateway::List.members
 				members.map! {|m| m.to_sym }
 				members.uniq!
 				Struct.new(*members).new
