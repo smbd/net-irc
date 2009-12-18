@@ -283,8 +283,10 @@ class TwitterIrcGateway < Net::IRC::Server::Session
 	end
 
 	def server_version
-		head = `git rev-parse HEAD 2>/dev/null`.chomp
-		head.empty?? "unknown" : head
+		@server_version ||= instance_eval {
+			head = `git rev-parse HEAD 2>/dev/null`.chomp
+			head.empty?? "unknown" : head
+		}
 	end
 
 	def available_user_modes
@@ -327,6 +329,7 @@ class TwitterIrcGateway < Net::IRC::Server::Session
 		@drones        = []
 		@etags         = {}
 		@consums       = []
+		@follower_ids  = []
 		@limit         = hourly_limit
 		@friends       =
 		@sources       =
@@ -336,6 +339,8 @@ class TwitterIrcGateway < Net::IRC::Server::Session
 		@utf7          =
 		@httpproxy     = nil
 		@ratelimit     = RateLimit.new(150)
+		@cert_store = OpenSSL::X509::Store.new
+		@cert_store.set_default_paths
 	end
 
 	def on_user(m)
@@ -421,9 +426,11 @@ class TwitterIrcGateway < Net::IRC::Server::Session
 			end
 		end if @opts.tid
 
+		check_friends
 		@ratelimit.register(:check_friends, 3600)
 		@check_friends_thread = Thread.start do
 			loop do
+				sleep @rate.interval(:check_friends)
 				begin
 					check_friends
 				rescue APIFailed => e
@@ -434,7 +441,6 @@ class TwitterIrcGateway < Net::IRC::Server::Session
 						@log.error "\t#{l}"
 					end
 				end
-				sleep @rate.interval(:check_friends)
 			end
 		end
 
@@ -456,6 +462,7 @@ class TwitterIrcGateway < Net::IRC::Server::Session
 			loop do
 				begin
 					@log.info "check_updates"
+					update_redundant_suffix
 					check_updates
 				rescue Exception => e
 					@log.error e.inspect
@@ -944,6 +951,14 @@ class TwitterIrcGateway < Net::IRC::Server::Session
 		end
 	end
 
+	ctcp_action "reload" do |target, mesg, command, args|
+		load File.expand_path(__FILE__)
+		current = server_version
+		@server_version = nil
+		log "Reloaded tig.rb. New: #{server_version} <- Old: #{current}"
+		post server_name, RPL_MYINFO, @nick, "#{server_name} #{server_version} #{available_user_modes} #{available_channel_modes}"
+	end
+
 	ctcp_action "call" do |target, mesg, command, args|
 		if args.size < 2
 			log "/me call <Twitter_screen_name> as <IRC_nickname>"
@@ -1171,8 +1186,11 @@ class TwitterIrcGateway < Net::IRC::Server::Session
 			if text.nil? or not text.include?(screen_name)
 				text = "#{screen_name} #{text}"
 			end
-			ret = api("statuses/update", { :status => text, :source => source,
-										   :in_reply_to_status_id => status.id })
+			ret = api("statuses/update", {
+				:status => text,
+				:source => source,
+				:in_reply_to_status_id => status.id
+			})
 			log oops(ret) if ret.truncated
 			msg = generate_status_message(status.text)
 			url = permalink(status)
@@ -1340,6 +1358,10 @@ class TwitterIrcGateway < Net::IRC::Server::Session
 					   "##{list.user.screen_name}^#{list.slug}"
 				members = page("1/#{@me.screen_name}/#{list.slug}/members", :users, true)
 				log "Miss match member_count '%s', lists:%d vs members:%s" % [ list.slug, list.member_count, members.size ] unless list.member_count == members.size
+				if list.member_count - members.size > 10
+					log "Miss match count is over 10. skip this list: #{list.slug}"
+					next
+				end
 
 				channel = {
 					:name      => name,
@@ -1358,10 +1380,8 @@ class TwitterIrcGateway < Net::IRC::Server::Session
 				end
 
 				# new user
-				(new - old).each do|user|
-					join name, [user]
-					updated = true
-				end
+				joined = join(name, new - old)
+				updated = true unless joined.empty?
 
 				channels[name] = channel
 			rescue APIFailed => e
@@ -1401,14 +1421,19 @@ class TwitterIrcGateway < Net::IRC::Server::Session
 			})
 			res.reverse_each do |s|
 				next if channel[:members].include? s.user
+				command = (s.user.id == @me.id) ?  NOTICE : PRIVMSG
+				command = channel[:last_id]     ? command : NOTICE
 				# TODO tid
-				message(s, name, nil, nil, channel[:last_id] ? PRIVMSG : NOTICE)
+				message(s, name, nil, nil, command)
 			end
 			channel[:last_id] = res.first.id
 		end
 	end
 
 	def check_friends
+		@follower_ids = page("followers/ids/#{@me.id}", :ids)
+		p @follower_ids
+
 		if @friends.nil?
 			@friends = page("statuses/friends/#{@me.id}", :users)
 			if @opts.athack
@@ -1510,7 +1535,7 @@ class TwitterIrcGateway < Net::IRC::Server::Session
 			end
 			@channels.each do |name, channel|
 				if channel[:members].find{|m| m.screen_name == user.screen_name }
-					message(status, name, tid, nil, cmd)
+					message(status, name, tid, nil, (user.id == @me.id) ? NOTICE : cmd)
 				end
 			end
 			updated = true
@@ -1573,15 +1598,25 @@ class TwitterIrcGateway < Net::IRC::Server::Session
 	end
 
 	def check_updates
-		update_redundant_suffix
-
 		uri = URI("http://github.com/api/v1/json/cho45/net-irc/commits/master")
 		@log.debug uri.inspect
 		res = http(uri).request(http_req(:get, uri))
 
-		latest = JSON.parse(res.body)['commits'][0]['id']
-		unless server_version == latest
+		commits = JSON.parse(res.body)['commits']
+		latest  = commits.first['id'][/^[0-9a-z]{40}$/]
+
+		raise "github API changed?" unless latest
+
+		is_in_local_repos = system("git rev-parse --verify #{latest} 2>/dev/null")
+		unless is_in_local_repos
+			current  = commits.map {|i| i['id'] }.index(server_version)
+			messages = commits[0..current].map {|i| i['message'] }
+
 			log "\002New version is available.\017 run 'git pull'."
+			messages[0, 3].each do |m|
+				log "  \002#{m[/.+/]}\017"
+			end
+			log "  ... and more. check it: http://bit.ly/79d33W" if messages.size > 3
 		end
 	rescue Errno::ECONNREFUSED, Timeout::Error => e
 		@log.error "Failed to get the latest revision of tig.rb from #{uri.host}: #{e.inspect}"
@@ -1592,13 +1627,18 @@ class TwitterIrcGateway < Net::IRC::Server::Session
 		users.each do |user|
 			prefix = prefix(user)
 			post prefix, JOIN, channel
-			params << prefix.nick if user.protected
+			case
+			when user.protected
+				params << ["v", prefix.nick]
+			when ! @follower_ids.include?(user.id)
+				params << ["o", prefix.nick]
+			end
 			next if params.size < MAX_MODE_PARAMS
 
-			post server_name, MODE, channel, "+#{"v" * params.size}", *params
+			post server_name, MODE, channel, "+#{params.map {|m,_| m }.join}", *params.map {|_,n| n}
 			params = []
 		end
-		post server_name, MODE, channel, "+#{"v" * params.size}", *params unless params.empty?
+		post server_name, MODE, channel, "+#{params.map {|m,_| m }.join}", *params.map {|_,n| n} unless params.empty?
 		users
 	end
 
@@ -1654,9 +1694,9 @@ class TwitterIrcGateway < Net::IRC::Server::Session
 		}x
 			true
 		when %r{
-       \A
-       (?: 1/#{@me.screen_name} )
-    }x
+			\A
+			(?: 1/#{@me.screen_name} )
+		}x
 			query.key? 'name' or query.key? '_method' or query.key? 'id'
 		end
 	end
@@ -2103,7 +2143,8 @@ class TwitterIrcGateway < Net::IRC::Server::Session
 		http.read_timeout = read_timeout if read_timeout # 60 by default
 		if uri.is_a? URI::HTTPS
 			http.use_ssl     = true
-			http.verify_mode = OpenSSL::SSL::VERIFY_NONE
+			http.cert_store = @cert_store
+			http.verify_mode = OpenSSL::SSL::VERIFY_PEER
 		end
 		http
 	rescue => e
@@ -2284,7 +2325,6 @@ class TwitterIrcGateway < Net::IRC::Server::Session
 		end
 
 		private :[]=
-		undef update, merge, merge!, replace
 	end
 
 	class RateLimit
