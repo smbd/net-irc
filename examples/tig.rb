@@ -1741,7 +1741,7 @@ class TwitterIrcGateway < Net::IRC::Server::Session
 
 		case
 		when authenticate
-			hourly_limit = ret["X-RateLimit-Limit"].to_i
+			hourly_limit = [150,ret["X-RateLimit-Limit"].to_i].min
 			unless hourly_limit.zero?
 				if @limit != hourly_limit
 					msg = "The rate limit per hour was changed: #{@limit} to #{hourly_limit}"
