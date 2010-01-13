@@ -2226,11 +2226,11 @@ class TwitterIrcGateway < Net::IRC::Server::Session
 	                    :profile_image_url, :profile_background_color, :profile_text_color,
 	                    :profile_link_color, :profile_sidebar_fill_color,
 	                    :profile_sidebar_border_color, :profile_background_image_url,
-	                    :profile_background_tile, :status)
+	                    :profile_background_tile, :status, :contributors_enabled, :lang)
 	Status = Struct.new(:id, :text, :source, :created_at, :truncated, :favorited, :geo,
 	                    :in_reply_to_status_id, :in_reply_to_user_id,
 	                    :in_reply_to_screen_name, :user,
-	                    :retweeted_status)
+	                    :retweeted_status, :contributors)
 	DM     = Struct.new(:id, :text, :created_at,
 	                    :sender_id, :sender_screen_name, :sender,
 	                    :recipient_id, :recipient_screen_name, :recipient)
